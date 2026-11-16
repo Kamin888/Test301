@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title SmartPropertyRental
+ * @notice ระบบจัดการสัญญาเช่าอสังหาริมทรัพย์และเงินประกัน (SmartLiving Property)
+ *
+ * Flow:
+ *  registerProperty -> createAgreement -> confirmAgreement (ทั้ง 2 ฝ่าย)
+ *  -> depositSecurity -> payRent (รายงวด)
+ *  -> [สิ้นสุดสัญญา] proposeSettlement -> acceptSettlement / finalizeSettlement
+ *                                      -> raiseDispute -> resolveDispute
+ */
+contract SmartPropertyRental {
+    // ============================ Types ============================
+    enum Status {
+        Created,           // เจ้าของห้องสร้างสัญญาแล้ว รอยืนยัน
+        Confirmed,         // ทั้งสองฝ่ายยืนยันแล้ว รอฝากเงินประกัน
+        Active,            // ฝากเงินประกันแล้ว สัญญามีผล
+        PendingSettlement, // เจ้าของห้องเสนอยอดหักแล้ว รอผู้เช่าตอบ
+        Disputed,          // มีข้อโต้แย้ง รอผู้มีอำนาจตัดสิน
+        Closed,            // ปิดสัญญา จ่ายเงินประกันเรียบร้อย
+        Cancelled          // ยกเลิกก่อนฝากเงินประกัน
+    }
+
+    struct Property {
+        uint256 id;
+        address owner;
+        string name;
+        uint256 monthlyRent;    // หน่วย wei
+        uint256 depositAmount;  // หน่วย wei
+        bool isRented;          // true = ถูกจอง/เช่าอยู่
+        bool exists;
+    }
+
+    struct Agreement {
+        uint256 id;
+        uint256 propertyId;
+        address landlord;
+        address tenant;
+        uint256 startDate;      // unix timestamp
+        uint256 endDate;        // unix timestamp
+        uint256 monthlyRent;    // snapshot ณ วันทำสัญญา
+        uint256 depositAmount;  // snapshot ณ วันทำสัญญา
+        string terms;           // เงื่อนไขสำคัญ
+        bool landlordConfirmed;
+        bool tenantConfirmed;
+        uint256 depositHeld;    // เงินประกันคงเหลือใน contract
+        uint256 paidPeriods;
+        uint256 totalPeriods;
+        uint256 proposedDeduction;
+        string deductionReason;
+        uint256 proposedAt;
+        string resolutionNote;  // บันทึกผลจากผู้มีอำนาจ
+        Status status;
+    }
+
+    struct Payment {
+        uint256 period;
+        uint256 amount;
+        uint256 paidAt;
+        address payer;
+    }
+
+    // ============================ State ============================
+    address public admin;
+    mapping(address => bool) public isArbitrator;
+
+    /// ระยะเวลา (วินาที) ที่แต่ละฝ่ายมีสิทธิ์ตอบสนองหลังสิ้นสุดสัญญา/หลังมีข้อเสนอหัก
+    uint256 public immutable responseWindow;
+
+    uint256 public propertyCount;
+    uint256 public agreementCount;
+
+    mapping(uint256 => Property) public properties;
+    mapping(uint256 => Agreement) private agreements;
+    mapping(uint256 => Payment[]) private payments;
+
+    mapping(address => uint256[]) private propertiesOf;
+    mapping(address => uint256[]) private agreementsOfLandlord;
+    mapping(address => uint256[]) private agreementsOfTenant;
+
+    uint256 private _lock = 1;
+
+    // ============================ Events ============================
+    event PropertyRegistered(uint256 indexed propertyId, address indexed owner, string name, uint256 monthlyRent, uint256 depositAmount);
+    event AgreementCreated(uint256 indexed agreementId, uint256 indexed propertyId, address indexed landlord, address tenant, uint256 startDate, uint256 endDate);
+    event AgreementConfirmed(uint256 indexed agreementId, address indexed by, bool fullyConfirmed);
+    event AgreementCancelled(uint256 indexed agreementId, address indexed by);
+    event DepositPaid(uint256 indexed agreementId, address indexed tenant, uint256 amount);
+    event RentPaid(uint256 indexed agreementId, uint256 period, address indexed payer, uint256 amount, uint256 timestamp);
+    event SettlementProposed(uint256 indexed agreementId, uint256 deduction, string reason);
+    event SettlementAccepted(uint256 indexed agreementId, address indexed by);
+    event DisputeRaised(uint256 indexed agreementId, address indexed tenant, string reason);
+    event DisputeResolved(uint256 indexed agreementId, address indexed arbitrator, uint256 toLandlord, uint256 toTenant, string note);
+    event DepositSettled(uint256 indexed agreementId, uint256 toLandlord, uint256 toTenant);
+    event ArbitratorUpdated(address indexed arbitrator, bool allowed);
+
+    // ============================ Modifiers ============================
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin");
+        _;
+    }
+
+    modifier onlyArbitrator() {
+        require(isArbitrator[msg.sender], "Only arbitrator");
+        _;
+    }
+
+    modifier nonReentrant() {
+        require(_lock == 1, "Reentrancy");
+        _lock = 2;
+        _;
+        _lock = 1;
+    }
+
+    modifier agreementExists(uint256 id) {
+        require(id > 0 && id <= agreementCount, "Agreement not found");
+        _;
+    }
+
+    // ============================ Constructor ============================
+    /// @param _responseWindow เช่น 604800 (7 วัน) ใช้งานจริง / 60 (1 นาที) ใช้ทดสอบ
+    constructor(uint256 _responseWindow) {
+        require(_responseWindow > 0, "Window must be > 0");
+        admin = msg.sender;
+        isArbitrator[msg.sender] = true;
+        responseWindow = _responseWindow;
+        emit ArbitratorUpdated(msg.sender, true);
+    }
+
+    // ============================ Admin ============================
+    function setArbitrator(address account, bool allowed) external onlyAdmin {
+        require(account != address(0), "Zero address");
+        isArbitrator[account] = allowed;
+        emit ArbitratorUpdated(account, allowed);
+    }
+
+    // ============================ 1. Register Property ============================
+    function registerProperty(
+        string calldata name,
+        uint256 monthlyRent,
+        uint256 depositAmount
+    ) external returns (uint256 id) {
+        require(bytes(name).length > 0, "Name required");
+        require(monthlyRent > 0, "Rent must be > 0");
+        require(depositAmount > 0, "Deposit must be > 0");
+
+        id = ++propertyCount;
+        properties[id] = Property({
+            id: id,
+            owner: msg.sender,
+            name: name,
+            monthlyRent: monthlyRent,
+            depositAmount: depositAmount,
+            isRented: false,
+            exists: true
+        });
+        propertiesOf[msg.sender].push(id);
+
+        emit PropertyRegistered(id, msg.sender, name, monthlyRent, depositAmount);
+    }
+
+    // ============================ 2. Create Rental Agreement ============================
+    function createAgreement(
+        uint256 propertyId,
+        address tenant,
+        uint256 startDate,
+        uint256 endDate,
+        string calldata terms
+    ) external returns (uint256 id) {
+        Property storage p = properties[propertyId];
+        require(p.exists, "Property not found");
+        require(p.owner == msg.sender, "Only property owner");
+        require(!p.isRented, "Property already reserved");
+        require(tenant != address(0) && tenant != msg.sender, "Invalid tenant");
+        require(endDate > startDate, "End must be after start");
+        require(endDate > block.timestamp, "End must be in the future");
+        require(bytes(terms).length > 0, "Terms required");
+
+        id = ++agreementCount;
+        Agreement storage a = agreements[id];
+        a.id = id;
+        a.propertyId = propertyId;
+        a.landlord = msg.sender;
+        a.tenant = tenant;
+        a.startDate = startDate;
+        a.endDate = endDate;
+        a.monthlyRent = p.monthlyRent;
+        a.depositAmount = p.depositAmount;
+        a.terms = terms;
+        a.totalPeriods = _calcPeriods(startDate, endDate);
+        a.status = Status.Created;
+
+        p.isRented = true;
+        agreementsOfLandlord[msg.sender].push(id);
+        agreementsOfTenant[tenant].push(id);
+
+        emit AgreementCreated(id, propertyId, msg.sender, tenant, startDate, endDate);
+    }
+
+    // ============================ 3. Confirm Agreement ============================
+    function confirmAgreement(uint256 id) external agreementExists(id) {
+        Agreement storage a = agreements[id];
+        require(a.status == Status.Created, "Not awaiting confirmation");
+
+        if (msg.sender == a.landlord) {
+            require(!a.landlordConfirmed, "Already confirmed");
+            a.landlordConfirmed = true;
+        } else if (msg.sender == a.tenant) {
+            require(!a.tenantConfirmed, "Already confirmed");
+            a.tenantConfirmed = true;
+        } else {
+            revert("Not a party");
+        }
+
+        bool both = a.landlordConfirmed && a.tenantConfirmed;
+        if (both) a.status = Status.Confirmed;
+
+        emit AgreementConfirmed(id, msg.sender, both);
+    }
+
+    /// ยกเลิกสัญญาได้ก่อนมีการฝากเงินประกันเท่านั้น
+    function cancelAgreement(uint256 id) external agreementExists(id) {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.landlord || msg.sender == a.tenant, "Not a party");
+        require(a.status == Status.Created || a.status == Status.Confirmed, "Cannot cancel now");
+
+        a.status = Status.Cancelled;
+        properties[a.propertyId].isRented = false;
+
+        emit AgreementCancelled(id, msg.sender);
+    }
+
+    // ============================ 4. Deposit Security ============================
+    function depositSecurity(uint256 id) external payable agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.tenant, "Only tenant");
+        require(a.status == Status.Confirmed, "Agreement not confirmed");
+        require(msg.value == a.depositAmount, "Incorrect deposit amount");
+
+        a.depositHeld = msg.value;
+        a.status = Status.Active;
+
+        emit DepositPaid(id, msg.sender, msg.value);
+    }
+
+    // ============================ 5. Record Rental Payment ============================
+    function payRent(uint256 id) external payable agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.tenant, "Only tenant");
+        require(a.status == Status.Active, "Agreement not active");
+        require(a.paidPeriods < a.totalPeriods, "All periods paid");
+        require(msg.value == a.monthlyRent, "Incorrect rent amount");
+
+        a.paidPeriods += 1;
+        uint256 period = a.paidPeriods;
+        payments[id].push(Payment(period, msg.value, block.timestamp, msg.sender));
+
+        emit RentPaid(id, period, msg.sender, msg.value, block.timestamp);
+
+        _send(a.landlord, msg.value); // ค่าเช่าโอนให้เจ้าของห้องทันที ไม่ปนกับเงินประกัน
+    }
+
+    // ============================ 6. Refund Deposit ============================
+    /// เจ้าของห้องตรวจสภาพห้องหลังสิ้นสุดสัญญา แล้วเสนอยอดหัก (0 = คืนเต็มจำนวน)
+    function proposeSettlement(
+        uint256 id,
+        uint256 deduction,
+        string calldata reason
+    ) external agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.landlord, "Only landlord");
+        require(a.status == Status.Active, "Agreement not active");
+        require(block.timestamp >= a.endDate, "Lease not ended");
+        require(deduction <= a.depositHeld, "Deduction exceeds deposit");
+
+        if (deduction == 0) {
+            // ไม่มีความเสียหาย -> คืนเต็มจำนวนทันที
+            emit SettlementProposed(id, 0, "No deduction");
+            _settle(a, 0);
+            return;
+        }
+
+        require(bytes(reason).length > 0, "Reason required for deduction");
+        a.proposedDeduction = deduction;
+        a.deductionReason = reason;
+        a.proposedAt = block.timestamp;
+        a.status = Status.PendingSettlement;
+
+        emit SettlementProposed(id, deduction, reason);
+    }
+
+    /// ผู้เช่ายอมรับยอดหัก -> จ่ายเงินทันที
+    function acceptSettlement(uint256 id) external agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.tenant, "Only tenant");
+        require(a.status == Status.PendingSettlement, "No pending settlement");
+
+        emit SettlementAccepted(id, msg.sender);
+        _settle(a, a.proposedDeduction);
+    }
+
+    /// ผู้เช่าไม่ตอบภายในกำหนด -> เจ้าของห้องปิดยอดตามที่เสนอได้
+    function finalizeSettlement(uint256 id) external agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.landlord, "Only landlord");
+        require(a.status == Status.PendingSettlement, "No pending settlement");
+        require(block.timestamp >= a.proposedAt + responseWindow, "Tenant response window open");
+
+        emit SettlementAccepted(id, msg.sender);
+        _settle(a, a.proposedDeduction);
+    }
+
+    /// เจ้าของห้องไม่ตรวจห้องภายในกำหนด -> ผู้เช่าขอคืนเต็มจำนวนได้
+    function claimRefundIfNoInspection(uint256 id) external agreementExists(id) nonReentrant {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.tenant, "Only tenant");
+        require(a.status == Status.Active, "Agreement not active");
+        require(block.timestamp >= a.endDate + responseWindow, "Inspection window open");
+
+        _settle(a, 0);
+    }
+
+    // ============================ 7. Rental Dispute ============================
+    function raiseDispute(uint256 id, string calldata reason) external agreementExists(id) {
+        Agreement storage a = agreements[id];
+        require(msg.sender == a.tenant, "Only tenant");
+        require(a.status == Status.PendingSettlement, "No pending settlement");
+        require(bytes(reason).length > 0, "Reason required");
+
+        a.status = Status.Disputed;
+        emit DisputeRaised(id, msg.sender, reason);
+    }
+
+    /// ผู้มีอำนาจ (arbitrator) ตัดสิน: amountToLandlord คือยอดที่หักให้เจ้าของห้อง ส่วนที่เหลือคืนผู้เช่า
+    function resolveDispute(
+        uint256 id,
+        uint256 amountToLandlord,
+        string calldata note
+    ) external agreementExists(id) onlyArbitrator nonReentrant {
+        Agreement storage a = agreements[id];
+        require(a.status == Status.Disputed, "Not in dispute");
+        require(msg.sender != a.landlord && msg.sender != a.tenant, "Arbitrator is a party");
+        require(amountToLandlord <= a.depositHeld, "Exceeds deposit balance");
+        require(bytes(note).length > 0, "Note required");
+
+        a.resolutionNote = note;
+        emit DisputeResolved(id, msg.sender, amountToLandlord, a.depositHeld - amountToLandlord, note);
+        _settle(a, amountToLandlord);
+    }
+
+    // ============================ Views ============================
+    function getAgreement(uint256 id) external view agreementExists(id) returns (Agreement memory) {
+        return agreements[id];
+    }
+
+    function getPayments(uint256 id) external view agreementExists(id) returns (Payment[] memory) {
+        return payments[id];
+    }
+
+    function getPropertiesOf(address owner) external view returns (uint256[] memory) {
+        return propertiesOf[owner];
+    }
+
+    function getAgreementsOfLandlord(address landlord) external view returns (uint256[] memory) {
+        return agreementsOfLandlord[landlord];
+    }
+
+    function getAgreementsOfTenant(address tenant) external view returns (uint256[] memory) {
+        return agreementsOfTenant[tenant];
+    }
+
+    function contractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    // ============================ Internal ============================
+    function _calcPeriods(uint256 start, uint256 end) internal pure returns (uint256) {
+        uint256 p = (end - start + 30 days - 1) / 30 days; // ปัดขึ้น
+        return p == 0 ? 1 : p;
+    }
+
+    /// จ่ายเงินประกัน: toLandlord ให้เจ้าของห้อง ที่เหลือคืนผู้เช่า (ไม่มีทางเกินยอดคงเหลือ)
+    function _settle(Agreement storage a, uint256 toLandlord) internal {
+        uint256 held = a.depositHeld;
+        require(toLandlord <= held, "Exceeds deposit balance");
+        uint256 toTenant = held - toLandlord;
+
+        // Effects ก่อน Interactions
+        a.depositHeld = 0;
+        a.status = Status.Closed;
+        properties[a.propertyId].isRented = false;
+
+        emit DepositSettled(a.id, toLandlord, toTenant);
+
+        if (toLandlord > 0) _send(a.landlord, toLandlord);
+        if (toTenant > 0) _send(a.tenant, toTenant);
+    }
+
+    function _send(address to, uint256 amount) internal {
+        (bool ok, ) = payable(to).call{value: amount}("");
+        require(ok, "ETH transfer failed");
+    }
+}
